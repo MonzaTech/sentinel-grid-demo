@@ -1,4 +1,4 @@
-# app.py - Sentinel Grid ULTRA DEMO (Grok Edition) - CLEANED & FUTURE-PROOF
+# app.py - Sentinel Grid ULTRA DEMO (Grok Edition) - WARNINGS FIXED
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -136,7 +136,7 @@ left, mid, right = st.columns([1.5, 3, 1.3])
 
 with left:
     st.subheader("Controls")
-    if st.button("Start Simulation", key="start", width='stretch'):
+    if st.button("Start Simulation", key="start"):
         if not (st.session_state.sim_thread and st.session_state.sim_thread.is_alive()):
             st.session_state.state["df"] = st.session_state.df.copy()
             stop_event = threading.Event()
@@ -148,7 +148,7 @@ with left:
             st.success("Started")
             st.rerun()
 
-    if st.button("Stop Simulation", key="stop", width='stretch'):
+    if st.button("Stop Simulation", key="stop"):
         if st.session_state.sim_thread and st.session_state.sim_thread.is_alive():
             st.session_state.sim_stop.set()
             st.session_state.sim_thread.join(timeout=2)
@@ -180,7 +180,7 @@ with left:
             st.success("Active")
 
     st.markdown("#### On-Chain Proofs")
-    if st.button("Publish Last 50 → Aptos Testnet", width='stretch'):
+    if st.button("Publish Last 50 → Aptos Testnet"):
         try:
             payload = {"hash": str(uuid.uuid4()), "data": display_df.tail(50).to_json(), "time": datetime.utcnow().isoformat()}
             r = requests.post("https://fullnode.testnet.aptoslabs.com/v1/transactions", json=payload, timeout=5)
@@ -191,12 +191,12 @@ with left:
         st.session_state.events.insert(0, {"time": datetime.utcnow(), "type": "commit", "msg": f"Published → {tx[:10]}..."})
         st.success(f"Committed: {tx[:10]}...")
 
-    if st.button("Relay Alert → Wormhole", width='stretch'):
+    if st.button("Relay Alert → Wormhole"):
         st.code("Wormhole VAA emitted — Solana devnet"); st.balloons()
 
-    if st.button("Export CSV", width='stretch'):
+    if st.button("Export CSV"):
         csv = st.session_state.state["df"].to_csv(index=False)
-        st.download_button("Download telemetry.csv", csv, "text/csv", "telemetry.csv", width='stretch')
+        st.download_button("Download telemetry.csv", csv, "text/csv", "telemetry.csv")
 
 with mid:
     tab1, tab2, tab3 = st.tabs(["Live Telemetry", "Dependency Graph", "Risk Forecast"])
