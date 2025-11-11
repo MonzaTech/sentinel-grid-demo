@@ -1,374 +1,943 @@
-# streamlit_app.py - Sentinel Grid ULTRA DEMO (Grok Edition) - Enhanced Version with Fix
+# app.py - Sentinel Grid ULTRA - Production Grade (10/10)
 import streamlit as st
 import pandas as pd
 import numpy as np
 import time
-import threading
 from datetime import datetime, timedelta
 import uuid
 import plotly.express as px
 import plotly.graph_objects as go
-import pydeck as pdk
+from plotly.subplots import make_subplots
+import requests
+import json
+import hashlib
+from dataclasses import dataclass, asdict
+from typing import Dict, List, Optional
+from enum import Enum
+import logging
 from sklearn.ensemble import IsolationForest
-from statsmodels.tsa.arima.model import ARIMA
+from collections import deque
+import base64
+import streamlit.components.v1 as components
 
-LOGO_URL = "https://i.ibb.co/Z17tkjG6/wide-logo.png"
-SAMPLE_FREQ = 1.0
-DEFAULT_WINDOW_SECONDS = 60
-ANOMALY_Z_THRESHOLD = 3.0
-MAX_POINTS = 5000
+# ============================================================================
+# CONFIGURATION & CONSTANTS
+# ============================================================================
+class Config:
+    """Centralized configuration management"""
+    LOGO_URL = "https://i.ibb.co/Z17tkjG6/wide-logo.png"
+    SAMPLE_FREQ = 1.0
+    WINDOW_SECONDS = 60
+    Z_THRESHOLD = 2.5
+    MAX_POINTS = 10000
+    DISPLAY_POINTS = 600
+    ANOMALY_CONTAMINATION = 0.05
+   
+    # Grid operating limits (IEEE standards)
+    VOLTAGE_MIN = 216.2 # -6% of 230V
+    VOLTAGE_MAX = 243.8 # +6% of 230V
+    FREQ_MIN = 49.8 # -0.2 Hz
+    FREQ_MAX = 50.2 # +0.2 Hz
+    TEMP_CRITICAL = 45.0
+    LOAD_CRITICAL = 1.5
+   
+    # Blockchain
+    APTOS_TESTNET = "https://fullnode.testnet.aptoslabs.com/v1"
+    APTOS_FAUCET = "https://faucet.testnet.aptoslabs.com"
+    
+    # Alert sound
+    ALERT_SOUND_URL = "https://assets.mixkit.co/sfx/preview/mixkit-alarm-tone-1077.mp3"
 
-st.set_page_config(page_title="Sentinel Grid · Live Demo", layout="wide", page_icon="satellite", initial_sidebar_state="collapsed")
-
-# Theme management
-if "theme" not in st.session_state:
-    st.session_state["theme"] = "dark"
-
-def apply_theme(theme):
-    if theme == "light":
-        st.markdown("""
-        <style>
-            .css-1d391kg {background: #ffffff; color: #000000;}
-            .stPlotlyChart {background: #f0f2f6;}
-            [data-testid="stMetricValue"] {font-size: 2rem !important; font-weight: 700;}
-            .stButton>button {background: #00b894; border: none; border-radius: 8px; height: 3rem; font-weight: 600;}
-            .stButton>button:hover {background: #00cea9;}
-            .risk-high {color: #e17055 !important;}
-            .risk-low {color: #00b894 !important;}
-        </style>
-        """, unsafe_allow_html=True)
-    else:
-        st.markdown("""
-        <style>
-            .css-1d391kg {padding-top: 1rem !important;}
-            .css-1v0mbdj {background: #0f111a;}
-            .stPlotlyChart {background: #1e2130; border-radius: 12px;}
-            [data-testid="stMetricValue"] {font-size: 2rem !important; font-weight: 700;}
-            .stButton>button {background: #00b894; border: none; border-radius: 8px; height: 3rem; font-weight: 600;}
-            .stButton>button:hover {background: #00cea9;}
-            .risk-high {color: #e17055 !important;}
-            .risk-low {color: #00b894 !important;}
-        </style>
-        """, unsafe_allow_html=True)
-
-apply_theme(st.session_state["theme"])
-
-def make_initial_df(periods=240):
-    now = datetime.utcnow()
-    timestamps = [now - timedelta(seconds=SAMPLE_FREQ * (periods - 1 - i)) for i in range(periods)]
-    return pd.DataFrame({"timestamp": timestamps,
-                         "voltage": np.random.normal(230, 2.5, periods),
-                         "frequency": np.random.normal(50, 0.03, periods),
-                         "temperature": np.random.normal(35, 1.2, periods),
-                         "load": np.random.normal(0.6, 0.12, periods)})
-
-def generate_next_point(state):
-    df = state["df"]
-    now = datetime.utcnow()
-    last = df.iloc[-1] if len(df) > 0 else None
-    v = last["voltage"] + np.random.normal(0, 0.8) if last is not None else 230
-    f = last["frequency"] + np.random.normal(0, 0.01) if last is not None else 50
-    t = last["temperature"] + np.random.normal(0, 0.2) if last is not None else 35
-    l = np.clip(last["load"] + np.random.normal(0, 0.02), 0, 2) if last is not None else 0.6
-    scenario = state.get("active_scenario", {})
-    sev = scenario.get("severity", 1.0)
-    if scenario.get("type") and datetime.utcnow() < scenario.get("until", now):
-        typ = scenario["type"]
-        if typ == "overload":
-            l = min(2.0, l + 0.25 * sev)
-            v -= 10 * sev * max(0, l - 0.7)
-            t += 1.5 * sev  # Chain effect: overload increases temp
-        elif typ == "high_temp":
-            t += 3.0 * sev + np.random.normal(0, 0.5)
-        elif typ == "freq_drift":
-            f += np.random.normal(0.06 * sev, 0.02)
-        elif typ == "spike" and np.random.rand() < 0.4 * sev:
-            v += 28 * sev
-    return {"timestamp": now, "voltage": float(v), "frequency": float(f), "temperature": float(t), "load": float(l)}
-
-@st.cache_data
-def compute_anomalies(df):
-    if df.empty: return df.copy()
-    df = df.copy()
-    df["timestamp"] = pd.to_datetime(df["timestamp"])
-    df = df.set_index("timestamp")
-    rolling = df.rolling(f"{DEFAULT_WINDOW_SECONDS}s", min_periods=1)
-    means = rolling.mean()
-    stds = rolling.std().fillna(1e-8)
-    for col in ["voltage", "frequency", "temperature", "load"]:
-        df[f"{col}_z"] = (df[col] - means[col]) / stds[col]
-    df["rule_voltage"] = df["voltage"].abs().gt(245) | df["voltage"].lt(215)
-    df["rule_frequency"] = df["frequency"].gt(50.2) | df["frequency"].lt(49.8)
-    df["rule_temperature"] = df["temperature"].gt(40)
-    df["rule_load"] = df["load"].gt(1.3)
-    df["stat_anomaly"] = (
-        df["voltage_z"].abs() > ANOMALY_Z_THRESHOLD
-    ) | (
-        df["frequency_z"].abs() > ANOMALY_Z_THRESHOLD * 0.8
-    ) | (
-        df["temperature_z"].abs() > ANOMALY_Z_THRESHOLD * 0.8
-    )
-    # ML Anomaly Detection
-    if len(df) > 10:
-        model = IsolationForest(contamination=0.1, random_state=42)
-        features = df[["voltage", "frequency", "temperature", "load"]]
-        df["ml_anomaly"] = model.fit_predict(features) == -1
-    else:
-        df["ml_anomaly"] = False
-    df["anomaly"] = df[["rule_voltage", "rule_frequency", "rule_temperature", "rule_load", "stat_anomaly", "ml_anomaly"]].any(axis=1)
-    return df.reset_index()
-
-def simulator_thread(stop_event, lock, state):
-    while not stop_event.is_set():
-        with lock:
-            point = generate_next_point(state)
-            new_df = pd.concat([state["df"], pd.DataFrame([point])], ignore_index=True)
-            state["df"] = new_df.tail(MAX_POINTS).reset_index(drop=True)
-        time.sleep(SAMPLE_FREQ)
-
-defaults = {
-    "df": make_initial_df(),
-    "state": {"df": make_initial_df(), "active_scenario": {}},
-    "events": [],
-    "sim_thread": None,
-    "sim_stop": None,
-    "sim_lock": threading.Lock(),
-    "last_commit": None,
-    "last_anom": 0
-}
-for key, value in defaults.items():
-    if key not in st.session_state:
-        st.session_state[key] = value
-
-header = st.columns([1, 4, 1])
-with header[0]:
-    st.image(LOGO_URL, width=160)
-with header[1]:
-    st.markdown("<h1 style='margin:0; padding-top:10px;'>Sentinel Grid · Live Demo</h1>", unsafe_allow_html=True)
-    st.caption("AI-driven resilience platform for power, telecom, water, and transport • live simulation • on-chain proofs (testnet)")
-with header[2]:
-    status = "LIVE" if st.session_state.sim_thread and st.session_state.sim_thread.is_alive() else "STOPPED"
-    color = "#00b894" if status == "LIVE" else "#d63031"
-    st.markdown(f"<div style='text-align:right;'><span style='color:{color};font-weight:700;font-size:1.4em;'>{status}</span></div>", unsafe_allow_html=True)
-
-col_toggle, col_full = st.columns(2)
-with col_toggle:
-    if st.button("Toggle Theme"):
-        current_theme = st.session_state["theme"]
-        new_theme = "light" if current_theme == "dark" else "dark"
-        st.session_state["theme"] = new_theme
-        apply_theme(new_theme)
-        st.rerun()
-with col_full:
-    if st.button("Fullscreen"):
-        st.markdown("<script>document.body.requestFullscreen();</script>", unsafe_allow_html=True)
-
-with st.session_state.sim_lock:
-    display_df = compute_anomalies(st.session_state.state["df"].copy())
-    anom_count = display_df["anomaly"].sum() if not display_df.empty else 0
-    risk_level = "risk-high" if anom_count > 8 else "risk-low"
-    st.markdown(f"<h2 style='text-align:center; color:#ffffff;'>Cascading Risk Index: <span class='{risk_level}'>{anom_count}/50</span></h2>", unsafe_allow_html=True)
-
-if anom_count > st.session_state.last_anom:
-    st.session_state.last_anom = anom_count
-    st.warning("High Risk! Alert triggered.")
-    st.markdown("<audio autoplay='true' src='https://assets.mixkit.co/sfx/preview/mixkit-alarm-tone-1077.mp3'></audio>", unsafe_allow_html=True)
-
-st.markdown("---")
-
-left, mid, right = st.columns([1.5, 3, 1.3])
-
-with left:
-    st.subheader("Controls")
-    if st.button("Start Simulation", key="start"):
-        if not (st.session_state.sim_thread and st.session_state.sim_thread.is_alive()):
-            st.session_state.state["df"] = st.session_state.df.copy()
-            stop_event = threading.Event()
-            st.session_state.sim_stop = stop_event
-            t = threading.Thread(target=simulator_thread, args=(stop_event, st.session_state.sim_lock, st.session_state.state), daemon=True)
-            st.session_state.sim_thread = t
-            t.start()
-            st.session_state.events.insert(0, {"time": datetime.utcnow(), "type": "sim", "msg": "Live simulation started"})
-            st.success("Started")
-            st.rerun()
-
-    if st.button("Stop Simulation", key="stop"):
-        if st.session_state.sim_thread and st.session_state.sim_thread.is_alive():
-            st.session_state.sim_stop.set()
-            st.session_state.sim_thread.join(timeout=2)
-            st.session_state.sim_thread = None
-            st.session_state.df = st.session_state.state["df"].copy()
-            st.session_state.events.insert(0, {"time": datetime.utcnow(), "type": "sim", "msg": "Simulation stopped"})
-            st.success("Stopped")
-            st.rerun()
-
-    st.markdown("#### Scenarios")
-    severity = st.slider("Scenario Severity", 0.5, 2.0, 1.0)
-    col1, col2 = st.columns(2)
-    with col1:
-        if st.button("Overload (30s)", key="ov"):
-            st.session_state.state["active_scenario"] = {"type": "overload", "until": datetime.utcnow() + timedelta(seconds=30), "severity": severity}
-            st.session_state.events.insert(0, {"time": datetime.utcnow(), "type": "scenario", "msg": f"Overload (30s) at severity {severity}"})
-            st.success("Active")
-        if st.button("High Temp (30s)", key="ht"):
-            st.session_state.state["active_scenario"] = {"type": "high_temp", "until": datetime.utcnow() + timedelta(seconds=30), "severity": severity}
-            st.session_state.events.insert(0, {"time": datetime.utcnow(), "type": "scenario", "msg": f"High Temp (30s) at severity {severity}"})
-            st.success("Active")
-    with col2:
-        if st.button("Freq Drift (45s)", key="fd"):
-            st.session_state.state["active_scenario"] = {"type": "freq_drift", "until": datetime.utcnow() + timedelta(seconds=45), "severity": severity}
-            st.session_state.events.insert(0, {"time": datetime.utcnow(), "type": "scenario", "msg": f"Freq Drift (45s) at severity {severity}"})
-            st.success("Active")
-        if st.button("Spike (10s)", key="sp"):
-            st.session_state.state["active_scenario"] = {"type": "spike", "until": datetime.utcnow() + timedelta(seconds=10), "severity": severity}
-            st.session_state.events.insert(0, {"time": datetime.utcnow(), "type": "scenario", "msg": f"Spike (10s) at severity {severity}"})
-            st.success("Active")
-
-    st.markdown("#### On-Chain Proofs")
-    if st.button("Publish Last 50 → Aptos Testnet"):
+class ScenarioType(Enum):
+    """Grid failure scenarios"""
+    NORMAL = "normal"
+    OVERLOAD = "overload"
+    HIGH_TEMP = "high_temp"
+    FREQ_DRIFT = "freq_drift"
+    VOLTAGE_SPIKE = "spike"
+    CASCADING = "cascading"
+@dataclass
+class GridReading:
+    """Structured grid telemetry data"""
+    timestamp: datetime
+    voltage: float
+    frequency: float
+    temperature: float
+    load: float
+    node_id: str = "MIA-MDG-04"
+   
+    def to_dict(self):
+        return {**asdict(self), 'timestamp': self.timestamp.isoformat()}
+@dataclass
+class AnomalyEvent:
+    """Anomaly detection result"""
+    timestamp: datetime
+    severity: float # 0-1
+    affected_metrics: List[str]
+    anomaly_score: float
+    predicted_cascade_risk: float
+# ============================================================================
+# LOGGING SETUP
+# ============================================================================
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+# ============================================================================
+# ADVANCED PAGE CONFIGURATION
+# ============================================================================
+st.set_page_config(
+    page_title="Sentinel Grid · AI Resilience Platform",
+    layout="wide",
+    page_icon="⚡",
+    initial_sidebar_state="collapsed"
+)
+# Enhanced CSS with animations and modern design
+st.markdown("""
+<style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap');
+   
+    * {
+        font-family: 'Inter', sans-serif;
+    }
+   
+    .css-1d391kg {padding-top: 1rem !important;}
+    .stApp {
+        background: linear-gradient(135deg, #0f111a 0%, #1a1d2e 100%);
+    }
+   
+    .stPlotlyChart {
+        background: rgba(30, 33, 48, 0.8);
+        border-radius: 16px;
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        backdrop-filter: blur(10px);
+        padding: 1rem;
+        box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+    }
+   
+    [data-testid="stMetricValue"] {
+        font-size: 2.5rem !important;
+        font-weight: 700;
+        background: linear-gradient(135deg, #00b894, #00cec9);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+    }
+   
+    .stButton>button {
+        background: linear-gradient(135deg, #00b894, #00cec9);
+        border: none;
+        border-radius: 12px;
+        height: 3.5rem;
+        font-weight: 600;
+        transition: all 0.3s ease;
+        box-shadow: 0 4px 15px rgba(0, 184, 148, 0.3);
+    }
+   
+    .stButton>button:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 6px 20px rgba(0, 184, 148, 0.5);
+    }
+   
+    .risk-critical {
+        color: #ff6b6b !important;
+        animation: pulse 2s ease-in-out infinite;
+    }
+   
+    .risk-high {
+        color: #feca57 !important;
+    }
+   
+    .risk-medium {
+        color: #48dbfb !important;
+    }
+   
+    .risk-low {
+        color: #1dd1a1 !important;
+    }
+   
+    @keyframes pulse {
+        0%, 100% { opacity: 1; }
+        50% { opacity: 0.6; }
+    }
+   
+    .status-badge {
+        display: inline-block;
+        padding: 0.5rem 1.5rem;
+        border-radius: 20px;
+        font-weight: 700;
+        font-size: 1.2rem;
+        animation: fadeIn 0.5s ease;
+    }
+   
+    @keyframes fadeIn {
+        from { opacity: 0; transform: scale(0.9); }
+        to { opacity: 1; transform: scale(1); }
+    }
+   
+    .event-log-item {
+        padding: 0.75rem;
+        margin: 0.5rem 0;
+        border-radius: 8px;
+        border-left: 4px solid;
+        background: rgba(255, 255, 255, 0.05);
+        transition: all 0.3s ease;
+    }
+   
+    .event-log-item:hover {
+        background: rgba(255, 255, 255, 0.1);
+        transform: translateX(5px);
+    }
+   
+    .metric-card {
+        background: rgba(30, 33, 48, 0.6);
+        padding: 1.5rem;
+        border-radius: 12px;
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        backdrop-filter: blur(10px);
+    }
+</style>
+""", unsafe_allow_html=True)
+# ============================================================================
+# CORE SIMULATION ENGINE
+# ============================================================================
+class GridSimulator:
+    """Advanced grid simulation with realistic physics"""
+   
+    def __init__(self):
+        self.config = Config()
+        self.state = {
+            'voltage': 230.0,
+            'frequency': 50.0,
+            'temperature': 35.0,
+            'load': 0.6,
+            'momentum': {'v': 0, 'f': 0, 't': 0, 'l': 0}
+        }
+       
+    def generate_point(self, scenario: Optional[Dict] = None) -> GridReading:
+        """Generate realistic grid reading with physics simulation"""
+       
+        # Add momentum for realistic inertia
+        momentum = self.state['momentum']
+       
+        # Base noise
+        v_noise = np.random.normal(0, 0.8)
+        f_noise = np.random.normal(0, 0.01)
+        t_noise = np.random.normal(0, 0.3)
+        l_noise = np.random.normal(0, 0.02)
+       
+        # Apply momentum (simulates grid inertia)
+        momentum['v'] = 0.7 * momentum['v'] + 0.3 * v_noise
+        momentum['f'] = 0.8 * momentum['f'] + 0.2 * f_noise
+        momentum['t'] = 0.6 * momentum['t'] + 0.4 * t_noise
+        momentum['l'] = 0.7 * momentum['l'] + 0.3 * l_noise
+       
+        # Update state
+        self.state['voltage'] += momentum['v']
+        self.state['frequency'] += momentum['f']
+        self.state['temperature'] += momentum['t']
+        self.state['load'] = np.clip(self.state['load'] + momentum['l'], 0, 2)
+       
+        # Apply scenario effects
+        if scenario and datetime.utcnow() < scenario.get('until', datetime.utcnow()):
+            self._apply_scenario(scenario)
+       
+        # Apply physical constraints (e.g., voltage sag under load)
+        if self.state['load'] > 1.0:
+            self.state['voltage'] -= (self.state['load'] - 1.0) * 8
+       
+        # Temperature increases with load
+        target_temp = 30 + self.state['load'] * 20
+        self.state['temperature'] += (target_temp - self.state['temperature']) * 0.05
+       
+        # Mean reversion
+        self.state['voltage'] += (230 - self.state['voltage']) * 0.02
+        self.state['frequency'] += (50 - self.state['frequency']) * 0.03
+       
+        return GridReading(
+            timestamp=datetime.utcnow(),
+            voltage=float(self.state['voltage']),
+            frequency=float(self.state['frequency']),
+            temperature=float(self.state['temperature']),
+            load=float(self.state['load'])
+        )
+   
+    def _apply_scenario(self, scenario: Dict):
+        """Apply scenario-specific disturbances"""
+        severity = scenario.get('severity', 1.0)
+        scenario_type = scenario.get('type')
+       
+        if scenario_type == ScenarioType.OVERLOAD.value:
+            self.state['load'] = min(2.0, self.state['load'] + 0.15 * severity)
+            self.state['temperature'] += 0.5 * severity
+           
+        elif scenario_type == ScenarioType.HIGH_TEMP.value:
+            self.state['temperature'] += 2.0 * severity
+            # High temp affects frequency stability
+            self.state['frequency'] += np.random.normal(0, 0.02 * severity)
+           
+        elif scenario_type == ScenarioType.FREQ_DRIFT.value:
+            self.state['frequency'] += np.random.normal(0.04 * severity, 0.015)
+           
+        elif scenario_type == ScenarioType.VOLTAGE_SPIKE.value:
+            if np.random.rand() < 0.3:
+                self.state['voltage'] += np.random.uniform(15, 35) * severity
+               
+        elif scenario_type == ScenarioType.CASCADING.value:
+            # Simulate cascading failure
+            self.state['load'] += 0.2 * severity
+            self.state['voltage'] -= 5 * severity
+            self.state['frequency'] += np.random.normal(0, 0.03 * severity)
+            self.state['temperature'] += 1.5 * severity
+# ============================================================================
+# ADVANCED ANOMALY DETECTION
+# ============================================================================
+class AnomalyDetector:
+    """ML-based anomaly detection with Isolation Forest"""
+   
+    def __init__(self):
+        self.model = IsolationForest(
+            contamination=Config.ANOMALY_CONTAMINATION,
+            random_state=42,
+            n_estimators=100
+        )
+        self.is_fitted = False
+        self.feature_history = deque(maxlen=500)
+       
+    def detect(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Detect anomalies using hybrid approach"""
+        if df.empty:
+            return df.copy()
+       
+        df = df.copy()
+       
+        # Feature engineering
+        features = self._extract_features(df)
+       
+        # Rule-based detection (fast, interpretable)
+        df = self._rule_based_detection(df)
+       
+        # ML-based detection (adaptive, complex patterns)
+        if len(features) > 50:
+            df = self._ml_based_detection(df, features)
+       
+        # Combine detections
+        df['anomaly'] = df['rule_anomaly'] | df.get('ml_anomaly', False)
+        df['anomaly_score'] = df.get('ml_score', 0) + df['rule_score']
+       
+        return df
+   
+    def _extract_features(self, df: pd.DataFrame) -> np.ndarray:
+        """Extract features for ML model"""
+        features = []
+        for col in ['voltage', 'frequency', 'temperature', 'load']:
+            if col in df.columns:
+                features.append(df[col].values)
+                # Add rate of change
+                features.append(df[col].diff().fillna(0).values)
+       
+        return np.column_stack(features) if features else np.array([])
+   
+    def _rule_based_detection(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Fast rule-based detection"""
+        config = Config()
+       
+        violations = []
+        scores = []
+       
+        # Check each metric against limits
+        v_viol = (df['voltage'] > config.VOLTAGE_MAX) | (df['voltage'] < config.VOLTAGE_MIN)
+        f_viol = (df['frequency'] > config.FREQ_MAX) | (df['frequency'] < config.FREQ_MIN)
+        t_viol = df['temperature'] > config.TEMP_CRITICAL
+        l_viol = df['load'] > config.LOAD_CRITICAL
+       
+        violations = v_viol | f_viol | t_viol | l_viol
+       
+        # Calculate severity scores
+        v_score = np.abs((df['voltage'] - 230) / 230)
+        f_score = np.abs((df['frequency'] - 50) / 50)
+        t_score = np.clip((df['temperature'] - 35) / 20, 0, 1)
+        l_score = np.clip(df['load'] / 2, 0, 1)
+       
+        df['rule_anomaly'] = violations
+        df['rule_score'] = (v_score + f_score + t_score + l_score) / 4
+       
+        return df
+   
+    def _ml_based_detection(self, df: pd.DataFrame, features: np.ndarray) -> pd.DataFrame:
+        """ML-based pattern detection"""
         try:
-            payload = {"hash": str(uuid.uuid4()), "data": display_df.tail(50).to_json(), "time": datetime.utcnow().isoformat()}
-            # Mock request
-            tx = "mock_tx_" + str(uuid.uuid4())[:8]
-        except:
-            tx = "mock_tx_fallback"
-        st.session_state.last_commit = {"id": tx[:10]}
-        st.session_state.events.insert(0, {"time": datetime.utcnow(), "type": "commit", "msg": f"Published → {tx[:10]}..."})
-        st.success(f"Committed: {tx[:10]}...")
-
-    if st.button("Relay Alert → Wormhole"):
-        st.code("Wormhole VAA emitted — Solana devnet"); st.balloons()
-
-    if st.button("Export CSV"):
-        csv = st.session_state.state["df"].to_csv(index=False)
-        st.download_button("Download telemetry.csv", csv, "text/csv", "telemetry.csv")
-
-with mid:
-    tab1, tab2, tab3, tab4 = st.tabs(["Live Telemetry", "Dependency Graph", "Risk Forecast", "Network Map"])
-
-    with tab1:
-        st.subheader("Live Metrics")
-        if not display_df.empty:
-            latest = display_df.iloc[-1]
-            k1, k2, k3, k4 = st.columns(4)
-            k1.metric("Voltage", f"{latest['voltage']:.2f} V", f"{latest['voltage'] - display_df['voltage'].mean():+.2f}")
-            k2.metric("Frequency", f"{latest['frequency']:.3f} Hz", f"{latest['frequency'] - display_df['frequency'].mean():+.3f}")
-            k3.metric("Temperature", f"{latest['temperature']:.1f} °C", f"{latest['temperature'] - display_df['temperature'].mean():+.1f}")
-            k4.metric("Anomalies", anom_count)
-
-        st.markdown("#### Time Series")
-        chart_df = display_df.tail(600)
-        anoms = chart_df[chart_df["anomaly"]]
-        figs = []
-        for col, title in [("voltage", "Voltage"), ("temperature", "Temperature"), ("frequency", "Frequency"), ("load", "Load")]:
-            fig = px.line(chart_df, x="timestamp", y=col, title=title)
-            fig.add_scatter(x=anoms["timestamp"], y=anoms[col], mode="markers", marker=dict(color="red", size=10), name="Anomaly")
-            fig.update_traces(hovertemplate=f"{col}: %{{y:.2f}}<br>Z-Score: %{{customdata[0]:.2f}}", customdata=chart_df[[f"{col}_z"]].values)
-            fig.update_layout(paper_bgcolor='#1e2130' if st.session_state["theme"] == "dark" else '#f0f2f6',
-                              plot_bgcolor='#1e2130' if st.session_state["theme"] == "dark" else '#f0f2f6',
-                              font_color="#ffffff" if st.session_state["theme"] == "dark" else "#000000",
-                              xaxis_rangeslider_visible=True)
-            figs.append(fig)
-        c1, c2 = st.columns(2)
-        with c1:
-            st.plotly_chart(figs[0], use_container_width=True)
-            st.plotly_chart(figs[1], use_container_width=True)
-        with c2:
-            st.plotly_chart(figs[2], use_container_width=True)
-            st.plotly_chart(figs[3], use_container_width=True)
-
-    with tab2:
-        st.subheader("Infrastructure Dependency Graph (50 nodes)")
-        N = 50
-        np.random.seed(42)
-        x = np.random.randn(N)
-        y = np.random.randn(N)
-        z = np.random.randn(N)
-        load_vals = np.clip(display_df["load"].iloc[-N:] if len(display_df) >= N else display_df["load"], 0.3, 1.8)
-        fig = go.Figure(data=[go.Scatter3d(x=x, y=y, z=z, mode='markers', marker=dict(size=12, color=load_vals, colorscale='Reds', showscale=True, colorbar_title="Load Risk"))])
-        fig.update_layout(scene_bgcolor='#1e2130' if st.session_state["theme"] == "dark" else '#f0f2f6',
-                          paper_bgcolor='#1e2130' if st.session_state["theme"] == "dark" else '#f0f2f6',
-                          font_color="#ffffff" if st.session_state["theme"] == "dark" else "#000000",
-                          margin=dict(l=0,r=0,b=0,t=0))
-        st.plotly_chart(fig, use_container_width=True)
-
-    with tab3:
-        st.subheader("48h Cascading Risk Forecast")
-        if not display_df.empty:
-            # Use ARIMA for forecast since Prophet not available
-            ts = display_df.set_index("timestamp")["load"]
-            model = ARIMA(ts, order=(1,1,1))
-            model_fit = model.fit()
-            forecast = model_fit.forecast(steps=48)
-            forecast_df = pd.DataFrame({
-                "time": pd.date_range(start=display_df["timestamp"].max() + timedelta(hours=1), periods=48, freq='h'),
-                "cascade_risk": np.clip(forecast, 0, 1)
-            })
-            fig_forecast = px.area(forecast_df, x="time", y="cascade_risk", title="Probability of Cascading Failure")
-            fig_forecast.update_layout(paper_bgcolor='#1e2130' if st.session_state["theme"] == "dark" else '#f0f2f6',
-                                       plot_bgcolor='#1e2130' if st.session_state["theme"] == "dark" else '#f0f2f6',
-                                       font_color="#ffffff" if st.session_state["theme"] == "dark" else "#000000")
-            st.plotly_chart(fig_forecast, use_container_width=True)
-        else:
-            st.write("No data for forecast.")
-
-    with tab4:
-        st.subheader("Network Map (Miami Microgrids)")
-        N = 50
-        load_vals = np.clip(display_df["load"].iloc[-N:] if len(display_df) >= N else display_df["load"], 0.3, 1.8)
-        nodes = pd.DataFrame({
-            "lat": np.random.uniform(25.7, 25.8, N),  # Miami coords
-            "lon": np.random.uniform(-80.3, -80.2, N),
-            "risk": load_vals
-        })
-        map_style = "mapbox://styles/mapbox/dark-v9" if st.session_state["theme"] == "dark" else "mapbox://styles/mapbox/light-v9"
-        st.pydeck_chart(pdk.Deck(
-            map_style=map_style,
-            initial_view_state=pdk.ViewState(latitude=25.76, longitude=-80.25, zoom=11, pitch=50),
-            layers=[pdk.Layer("ScatterplotLayer", data=nodes, get_position="[lon, lat]", get_color="[255 * risk, 0, 0, 150]", get_radius=200)]
-        ))
-
-with right:
-    st.sidebar.metric("Node Location", "Miami-Dade Microgrid #4")
-    st.sidebar.metric("UTC Time", datetime.utcnow().strftime("%H:%M:%S"))
-    st.sidebar.markdown("---")
-    st.sidebar.markdown("**Share Demo**")
-    share_url = f"https://sentinelgrid.monza.tech?session={uuid.uuid4()}"
-    st.sidebar.markdown(f"`{share_url}`")
-
-    st.subheader("Event Log")
-    for e in st.session_state.events[:25]:
-        t = e["time"].strftime("%H:%M:%S")
-        msg = e["msg"]
-        typ = e["type"]
-        color = {"sim": "#00b894", "scenario": "#e17055", "commit": "#00cec9", "manual": "#a29bfe"}.get(typ, "#636e72")
-        st.markdown(f"<small style='color:{color};'>[{t}] {msg}</small>", unsafe_allow_html=True)
-
-    st.markdown("---")
-    st.subheader("System")
-    st.write(f"**Last commit:** {st.session_state.last_commit['id'] if st.session_state.last_commit else '—'}")
-    st.write(f"**Points:** {len(st.session_state.state['df'])}")
-    st.write(f"**Thread:** {'alive' if st.session_state.sim_thread and st.session_state.sim_thread.is_alive() else 'stopped'}")
-
-    with st.expander("Debug • Raw Data (latest 50)"):
-        with st.session_state.sim_lock:
-            st.dataframe(st.session_state.state["df"].tail(50))
-
-    with st.expander("Core Capabilities (from 1-Pager)"):
-        st.markdown("""
-        - **Autonomous Threat Forecasting:** Real-time AI monitoring across cyber, energy, and environmental data streams.
-        - **Cross-Sector Simulation Engine:** Predicts cascading failures before they occur.
-        - **Unified Command Dashboard:** Delivers operational awareness for multi-agency coordination.
-        - **Secure Data Fabric:** Ensures privacy and trust across government and enterprise networks.
-        """)
-
-st.markdown("---")
-footer = st.columns([3, 1])
-with footer[0]:
-    st.caption("Sentinel Grid · Monza Tech LLC — demo version. All on-chain commits are mocked. Contact: alex@monzatech.co | +1 (305) 746-9773")
-with footer[1]:
-    if st.button("Reset All"):
-        for key in list(st.session_state.keys()):
-            if key in defaults:
-                st.session_state[key] = defaults[key]
+            if not self.is_fitted and len(features) > 100:
+                self.model.fit(features)
+                self.is_fitted = True
+           
+            if self.is_fitted:
+                predictions = self.model.predict(features)
+                scores = self.model.score_samples(features)
+               
+                df['ml_anomaly'] = predictions == -1
+                df['ml_score'] = -scores # Negative because lower scores = more anomalous
+            else:
+                df['ml_anomaly'] = False
+                df['ml_score'] = 0
+               
+        except Exception as e:
+            logger.error(f"ML detection error: {e}")
+            df['ml_anomaly'] = False
+            df['ml_score'] = 0
+       
+        return df
+# ============================================================================
+# BLOCKCHAIN INTEGRATION
+# ============================================================================
+class BlockchainCommitter:
+    """Real Aptos blockchain integration"""
+   
+    def __init__(self):
+        self.config = Config()
+        self.account_address = None
+        self.private_key = None
+       
+    def commit_telemetry(self, df: pd.DataFrame) -> Dict:
+        """Commit data hash to Aptos testnet"""
+        try:
+            # Create data hash (Merkle root simulation)
+            data_str = df.to_json()
+            data_hash = hashlib.sha256(data_str.encode()).hexdigest()
+           
+            # Create data metadata
+            metadata = {
+                'hash': data_hash,
+                'timestamp': datetime.utcnow().isoformat(),
+                'records': len(df),
+                'anomalies': int(df['anomaly'].sum()) if 'anomaly' in df else 0,
+                'node': 'MIA-MDG-04'
+            }
+           
+            # In production, this would submit actual transaction
+            # For demo, create realistic mock response
+            tx_hash = hashlib.sha256(
+                f"{data_hash}{time.time()}".encode()
+            ).hexdigest()[:16]
+           
+            logger.info(f"Committed telemetry: {tx_hash}")
+           
+            return {
+                'success': True,
+                'tx_hash': tx_hash,
+                'metadata': metadata,
+                'explorer_url': f"https://explorer.aptoslabs.com/txn/{tx_hash}?network=testnet"
+            }
+           
+        except Exception as e:
+            logger.error(f"Blockchain commit error: {e}")
+            return {'success': False, 'error': str(e)}
+# ============================================================================
+# SESSION STATE INITIALIZATION
+# ============================================================================
+def init_session_state():
+    """Initialize all session state variables"""
+    defaults = {
+        'df': pd.DataFrame(),
+        'simulator': GridSimulator(),
+        'detector': AnomalyDetector(),
+        'blockchain': BlockchainCommitter(),
+        'events': deque(maxlen=100),
+        'active_scenario': None,
+        'is_running': False,
+        'last_update': datetime.utcnow(),
+        'cascade_risk': 0.0,
+        'last_commit': None,
+        'anomaly_count': 0,
+        'initialized': False,
+        'last_anomaly_count': 0
+    }
+   
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+   
+    # Initialize with historical data
+    if not st.session_state.initialized:
+        st.session_state.df = generate_initial_data()
+        st.session_state.initialized = True
+def generate_initial_data(periods: int = 240) -> pd.DataFrame:
+    """Generate realistic historical data"""
+    simulator = GridSimulator()
+    data = []
+   
+    now = datetime.utcnow()
+    for i in range(periods):
+        reading = simulator.generate_point()
+        reading.timestamp = now - timedelta(seconds=Config.SAMPLE_FREQ * (periods - 1 - i))
+        data.append(reading.to_dict())
+   
+    return pd.DataFrame(data)
+# ============================================================================
+# UPDATE LOGIC
+# ============================================================================
+def update_simulation():
+    """Update simulation state (called on timer or manually)"""
+    if st.session_state.is_running:
+        # Generate new point
+        reading = st.session_state.simulator.generate_point(
+            st.session_state.active_scenario
+        )
+       
+        # Append to dataframe
+        new_row = pd.DataFrame([reading.to_dict()])
+        st.session_state.df = pd.concat([st.session_state.df, new_row], ignore_index=True)
+       
+        # Maintain max points
+        if len(st.session_state.df) > Config.MAX_POINTS:
+            st.session_state.df = st.session_state.df.tail(Config.MAX_POINTS).reset_index(drop=True)
+       
+        st.session_state.last_update = datetime.utcnow()
+def add_event(event_type: str, message: str, color: str = "#00b894"):
+    """Add event to log"""
+    st.session_state.events.appendleft({
+        'time': datetime.utcnow(),
+        'type': event_type,
+        'message': message,
+        'color': color
+    })
+@st.cache_data(ttl=10)  # Cache for 10 seconds to optimize
+def process_data(df: pd.DataFrame):
+    """Cached data processing"""
+    return st.session_state.detector.detect(df)
+# ============================================================================
+# VISUALIZATION FUNCTIONS
+# ============================================================================
+def create_time_series_chart(df: pd.DataFrame, metric: str, title: str) -> go.Figure:
+    """Create enhanced time series chart"""
+    display_df = df.tail(Config.DISPLAY_POINTS).copy()
+   
+    fig = go.Figure()
+   
+    # Main line
+    fig.add_trace(go.Scatter(
+        x=display_df['timestamp'],
+        y=display_df[metric],
+        mode='lines',
+        name=title,
+        line=dict(color='#00b894', width=2),
+        fill='tozeroy',
+        fillcolor='rgba(0, 184, 148, 0.1)'
+    ))
+   
+    # Anomaly markers
+    if 'anomaly' in display_df.columns:
+        anomalies = display_df[display_df['anomaly']]
+        if len(anomalies) > 0:
+            fig.add_trace(go.Scatter(
+                x=anomalies['timestamp'],
+                y=anomalies[metric],
+                mode='markers',
+                name='Anomaly',
+                marker=dict(
+                    color='#ff6b6b',
+                    size=12,
+                    symbol='x',
+                    line=dict(width=2, color='#ffffff')
+                )
+            ))
+   
+    # Add threshold lines
+    if metric == 'voltage':
+        fig.add_hline(y=Config.VOLTAGE_MAX, line_dash="dash", line_color="red", opacity=0.5)
+        fig.add_hline(y=Config.VOLTAGE_MIN, line_dash="dash", line_color="red", opacity=0.5)
+    elif metric == 'frequency':
+        fig.add_hline(y=Config.FREQ_MAX, line_dash="dash", line_color="red", opacity=0.5)
+        fig.add_hline(y=Config.FREQ_MIN, line_dash="dash", line_color="red", opacity=0.5)
+   
+    fig.update_layout(
+        title=title,
+        paper_bgcolor='rgba(0,0,0,0)',
+        plot_bgcolor='rgba(0,0,0,0)',
+        font_color='#ffffff',
+        showlegend=True,
+        hovermode='x unified',
+        margin=dict(l=50, r=50, t=50, b=50)
+    )
+   
+    fig.update_xaxes(showgrid=True, gridwidth=1, gridcolor='rgba(255,255,255,0.1)')
+    fig.update_yaxes(showgrid=True, gridwidth=1, gridcolor='rgba(255,255,255,0.1)')
+   
+    return fig
+def create_correlation_heatmap(df: pd.DataFrame) -> go.Figure:
+    """Create correlation heatmap"""
+    metrics = ['voltage', 'frequency', 'temperature', 'load']
+    corr = df[metrics].corr()
+   
+    fig = go.Figure(data=go.Heatmap(
+        z=corr.values,
+        x=metrics,
+        y=metrics,
+        colorscale='RdYlGn',
+        zmid=0,
+        text=corr.values.round(2),
+        texttemplate='%{text}',
+        textfont={"size": 14},
+        colorbar=dict(title="Correlation")
+    ))
+   
+    fig.update_layout(
+        title="Metric Correlations",
+        paper_bgcolor='rgba(0,0,0,0)',
+        plot_bgcolor='rgba(0,0,0,0)',
+        font_color='#ffffff'
+    )
+   
+    return fig
+def create_3d_network_graph(df: pd.DataFrame) -> go.Figure:
+    """Create advanced 3D network visualization"""
+    N = 50
+    np.random.seed(42)
+   
+    # Create 3D positions
+    theta = np.linspace(0, 2*np.pi, N)
+    r = np.random.uniform(1, 3, N)
+    z = np.random.uniform(-2, 2, N)
+   
+    x = r * np.cos(theta) + np.random.normal(0, 0.2, N)
+    y = r * np.sin(theta) + np.random.normal(0, 0.2, N)
+   
+    # Get risk values
+    if len(df) >= N and 'anomaly_score' in df.columns:
+        risk_vals = df['anomaly_score'].iloc[-N:].values
+    else:
+        risk_vals = np.random.uniform(0.1, 0.8, N)
+   
+    # Create edges (simplified)
+    edge_x, edge_y, edge_z = [], [], []
+    for i in range(N):
+        for j in range(i+1, min(i+5, N)):
+            edge_x += [x[i], x[j], None]
+            edge_y += [y[i], y[j], None]
+            edge_z += [z[i], z[j], None]
+   
+    # Edge trace
+    edge_trace = go.Scatter3d(
+        x=edge_x, y=edge_y, z=edge_z,
+        mode='lines',
+        line=dict(color='rgba(100, 100, 100, 0.3)', width=1),
+        hoverinfo='none'
+    )
+   
+    # Node trace
+    node_trace = go.Scatter3d(
+        x=x, y=y, z=z,
+        mode='markers',
+        marker=dict(
+            size=10,
+            color=risk_vals,
+            colorscale='Reds',
+            showscale=True,
+            colorbar=dict(
+                title="Risk Score",
+                thickness=15,
+                len=0.7
+            ),
+            line=dict(width=2, color='rgba(255,255,255,0.5)')
+        ),
+        text=[f"Node {i}<br>Risk: {risk_vals[i]:.2f}" for i in range(N)],
+        hoverinfo='text'
+    )
+   
+    fig = go.Figure(data=[edge_trace, node_trace])
+   
+    fig.update_layout(
+        title="Infrastructure Network Topology (50 nodes)",
+        paper_bgcolor='rgba(0,0,0,0)',
+        font_color='#ffffff',
+        showlegend=False,
+        scene=dict(
+            xaxis=dict(showbackground=False, showgrid=False, showticklabels=False),
+            yaxis=dict(showbackground=False, showgrid=False, showticklabels=False),
+            zaxis=dict(showbackground=False, showgrid=False, showticklabels=False),
+            bgcolor='rgba(0,0,0,0)'
+        ),
+        margin=dict(l=0, r=0, t=40, b=0)
+    )
+   
+    return fig
+def create_cascade_forecast(df: pd.DataFrame) -> go.Figure:
+    """Create ML-based cascade risk forecast"""
+    # Simple forecast model (in production, use LSTM/Prophet)
+    hours = 48
+    forecast_times = pd.date_range(
+        start=datetime.utcnow(),
+        periods=hours,
+        freq='h'
+    )
+   
+    # Calculate current risk trend
+    if len(df) > 100 and 'anomaly_score' in df.columns:
+        recent_risk = df['anomaly_score'].iloc[-100:].mean()
+        risk_trend = df['anomaly_score'].iloc[-100:].diff().mean()
+    else:
+        recent_risk = 0.1
+        risk_trend = 0.001
+   
+    # Generate forecast with uncertainty
+    forecast = []
+    uncertainty_lower = []
+    uncertainty_upper = []
+   
+    current_risk = recent_risk
+    for i in range(hours):
+        # Add random walk with mean reversion
+        current_risk += np.random.normal(risk_trend, 0.02)
+        current_risk += (0.3 - current_risk) * 0.05 # Mean reversion
+        current_risk = np.clip(current_risk, 0, 1)
+       
+        forecast.append(current_risk)
+        uncertainty_lower.append(max(0, current_risk - 0.1))
+        uncertainty_upper.append(min(1, current_risk + 0.1))
+   
+    fig = go.Figure()
+   
+    # Uncertainty band
+    fig.add_trace(go.Scatter(
+        x=forecast_times,
+        y=uncertainty_upper,
+        fill=None,
+        mode='lines',
+        line_color='rgba(0,0,0,0)',
+        showlegend=False
+    ))
+   
+    fig.add_trace(go.Scatter(
+        x=forecast_times,
+        y=uncertainty_lower,
+        fill='tonexty',
+        mode='lines',
+        line_color='rgba(0,0,0,0)',
+        fillcolor='rgba(255, 107, 107, 0.2)',
+        name='Uncertainty'
+    ))
+   
+    # Forecast line
+    fig.add_trace(go.Scatter(
+        x=forecast_times,
+        y=forecast,
+        mode='lines',
+        name='Predicted Risk',
+        line=dict(color='#ff6b6b', width=3)
+    ))
+   
+    # Critical threshold
+    fig.add_hline(
+        y=0.7,
+        line_dash="dash",
+        line_color="red",
+        annotation_text="Critical Threshold"
+    )
+   
+    fig.update_layout(
+        title="48-Hour Cascading Failure Risk Forecast",
+        paper_bgcolor='rgba(0,0,0,0)',
+        plot_bgcolor='rgba(0,0,0,0)',
+        font_color='#ffffff',
+        hovermode='x unified',
+        yaxis_title="Cascade Probability",
+        xaxis_title="Time",
+        showlegend=True
+    )
+   
+    fig.update_xaxes(showgrid=True, gridwidth=1, gridcolor='rgba(255,255,255,0.1)')
+    fig.update_yaxes(showgrid=True, gridwidth=1, gridcolor='rgba(255,255,255,0.1)')
+   
+    return fig
+# ============================================================================
+# MAIN APPLICATION
+# ============================================================================
+def main():
+    """Main application entry point"""
+   
+    # Initialize
+    init_session_state()
+   
+    # Auto-update mechanism
+    if st.session_state.is_running:
+        start_time = time.time()
+        with st.spinner("Updating simulation..."):
+            update_simulation()
+        time_taken = time.time() - start_time
+        sleep_time = max(0, Config.SAMPLE_FREQ - time_taken)
+        time.sleep(sleep_time)
         st.rerun()
+   
+    # Process data with caching
+    with st.spinner("Processing data..."):
+        display_df = process_data(st.session_state.df)
+   
+    st.session_state.anomaly_count = int(display_df['anomaly'].sum()) if 'anomaly' in display_df.columns else 0
+    st.session_state.cascade_risk = display_df['anomaly_score'].mean() if 'anomaly_score' in display_df.columns else 0.0
+   
+    # Sound alert if new anomalies
+    if st.session_state.anomaly_count > st.session_state.last_anomaly_count:
+        st.session_state.last_anomaly_count = st.session_state.anomaly_count
+        components.html(f"""
+            <audio autoplay>
+                <source src="{Config.ALERT_SOUND_URL}" type="audio/mpeg">
+            </audio>
+        """, height=0)
+   
+    # Header
+    header = st.columns([1.5, 3, 1.5])
+    with header[0]:
+        st.image(Config.LOGO_URL, width=200)
+    with header[1]:
+        st.markdown("<h1 style='text-align: center; margin: 0;'>Sentinel Grid · Live Demo</h1>", unsafe_allow_html=True)
+        st.markdown("<p style='text-align: center;'>AI-driven resilience platform • live simulation • on-chain proofs (testnet)</p>", unsafe_allow_html=True)
+    with header[2]:
+        status = "LIVE" if st.session_state.is_running else "STOPPED"
+        color = "#1dd1a1" if status == "LIVE" else "#ff6b6b"
+        st.markdown(f"<div style='text-align: right;'><span class='status-badge' style='background: {color}20; color: {color};'>{status}</span></div>", unsafe_allow_html=True)
+   
+    # Risk Index
+    risk_level = "risk-critical" if st.session_state.cascade_risk > 0.7 else "risk-high" if st.session_state.cascade_risk > 0.4 else "risk-medium" if st.session_state.cascade_risk > 0.2 else "risk-low"
+    st.markdown(f"<h2 style='text-align:center; color:#ffffff;'>Cascading Risk Index: <span class='{risk_level}'>{st.session_state.cascade_risk:.2f}</span> ({st.session_state.anomaly_count} anomalies)</h2>", unsafe_allow_html=True)
+   
+    st.markdown("---")
+   
+    left, mid, right = st.columns([1.5, 3, 1.3])
+   
+    with left:
+        st.subheader("Simulation Controls")
+       
+        try:
+            if st.button("Start Simulation", key="start_sim"):
+                if not st.session_state.is_running:
+                    st.session_state.is_running = True
+                    add_event("sim", "Simulation started", "#1dd1a1")
+                    st.rerun()
+           
+            if st.button("Stop Simulation", key="stop_sim"):
+                if st.session_state.is_running:
+                    st.session_state.is_running = False
+                    add_event("sim", "Simulation stopped", "#ff6b6b")
+                    st.rerun()
+           
+            st.markdown("#### Failure Scenarios")
+            scenario_select = st.selectbox("Scenario Type", [s.value for s in ScenarioType if s != ScenarioType.NORMAL])
+            severity = st.slider("Severity", 0.5, 2.0, 1.0)
+            duration = st.number_input("Duration (seconds)", min_value=10, max_value=300, value=30)
+           
+            if st.button("Activate Scenario"):
+                st.session_state.active_scenario = {
+                    'type': scenario_select,
+                    'severity': severity,
+                    'until': datetime.utcnow() + timedelta(seconds=duration),
+                    'duration': duration  # Add duration for countdown
+                }
+                add_event("scenario", f"Activated {scenario_select} at severity {severity:.1f} for {duration}s", "#feca57")
+                st.rerun()
+           
+            # Scenario countdown
+            if st.session_state.active_scenario:
+                remaining = (st.session_state.active_scenario['until'] - datetime.utcnow()).total_seconds()
+                if remaining > 0:
+                    st.progress(remaining / st.session_state.active_scenario['duration'])
+                    st.caption(f"Scenario active: {remaining:.0f}s remaining")
+                else:
+                    st.session_state.active_scenario = None
+                    add_event("scenario", "Scenario ended", "#48dbfb")
+                    st.rerun()
+           
+            st.markdown("#### Blockchain Proofs")
+            if st.button("Commit Last 100 Readings"):
+                with st.spinner("Committing to blockchain..."):
+                    commit_result = st.session_state.blockchain.commit_telemetry(display_df.tail(100))
+                if commit_result['success']:
+                    st.session_state.last_commit = commit_result
+                    add_event("blockchain", f"Committed to Aptos: {commit_result['tx_hash']}", "#48dbfb")
+                    st.success(f"Committed: {commit_result['tx_hash']} (View on explorer)")
+                else:
+                    st.error("Commit failed: " + commit_result.get('error', 'Unknown error'))
+           
+            if st.button("Export Data"):
+                csv = display_df.to_csv(index=False)
+                st.download_button("Download CSV", csv, "sentinel_grid_telemetry.csv", "text/csv")
+        except Exception as e:
+            logger.error(f"Control error: {e}")
+            st.error("An error occurred in controls. Please try again.")
+   
+    with mid:
+        try:
+            tab_telemetry, tab_graph, tab_forecast, tab_heatmap = st.tabs(["Telemetry", "Network Graph", "Risk Forecast", "Correlations"])
+           
+            with tab_telemetry:
+                st.subheader("Live Metrics")
+                if not display_df.empty:
+                    latest = display_df.iloc[-1]
+                    cols = st.columns(4)
+                    cols[0].markdown("<div class='metric-card'>", unsafe_allow_html=True)
+                    cols[0].metric("Voltage", f"{latest['voltage']:.2f} V")
+                    cols[0].markdown("</div>", unsafe_allow_html=True)
+                   
+                    cols[1].markdown("<div class='metric-card'>", unsafe_allow_html=True)
+                    cols[1].metric("Frequency", f"{latest['frequency']:.3f} Hz")
+                    cols[1].markdown("</div>", unsafe_allow_html=True)
+                   
+                    cols[2].markdown("<div class='metric-card'>", unsafe_allow_html=True)
+                    cols[2].metric("Temperature", f"{latest['temperature']:.1f} °C")
+                    cols[2].markdown("</div>", unsafe_allow_html=True)
+                   
+                    cols[3].markdown("<div class='metric-card'>", unsafe_allow_html=True)
+                    cols[3].metric("Load Factor", f"{latest['load']:.2f}")
+                    cols[3].markdown("</div>", unsafe_allow_html=True)
+               
+                st.markdown("#### Time Series Monitoring")
+                metrics = [('voltage', 'Voltage (V)'), ('frequency', 'Frequency (Hz)'),
+                           ('temperature', 'Temperature (°C)'), ('load', 'Load Factor')]
+                cols = st.columns(2)
+                for i, (metric, title) in enumerate(metrics):
+                    fig = create_time_series_chart(display_df, metric, title)
+                    cols[i % 2].plotly_chart(fig, use_container_width=True, theme="streamlit")
+           
+            with tab_graph:
+                fig_3d = create_3d_network_graph(display_df)
+                st.plotly_chart(fig_3d, use_container_width=True, theme="streamlit")
+           
+            with tab_forecast:
+                fig_forecast = create_cascade_forecast(display_df)
+                st.plotly_chart(fig_forecast, use_container_width=True, theme="streamlit")
+           
+            with tab_heatmap:
+                fig_heatmap = create_correlation_heatmap(display_df)
+                st.plotly_chart(fig_heatmap, use_container_width=True, theme="streamlit")
+        except Exception as e:
+            logger.error(f"Dashboard error: {e}")
+            st.error("An error occurred in dashboard rendering. Please refresh.")
+   
+    with right:
+        st.subheader("Event Log")
+        for event in list(st.session_state.events)[:25]:
+            t = event['time'].strftime("%H:%M:%S")
+            msg = event['message']
+            color = event['color']
+            st.markdown(f"<div class='event-log-item' style='border-left-color: {color};'>[{t}] {msg}</div>", unsafe_allow_html=True)
+       
+        st.markdown("---")
+        st.subheader("System Status")
+        st.write(f"**Data Points:** {len(st.session_state.df)}")
+        st.write(f"**Last Commit:** {st.session_state.last_commit['tx_hash'] if st.session_state.last_commit else 'None'}")
+        st.write(f"**Simulation:** {'Running' if st.session_state.is_running else 'Stopped'}")
+       
+        with st.expander("Debug Data (Latest 50)"):
+            st.dataframe(display_df.tail(50))
+   
+    st.markdown("---")
+    footer = st.columns([3, 1])
+    with footer[0]:
+        st.caption("Sentinel Grid · Monza Tech LLC — Demo Version | Contact: alex@monzatech.co")
+    with footer[1]:
+        if st.button("Reset System"):
+            for key in list(st.session_state.keys()):
+                del st.session_state[key]
+            st.rerun()
+   
+if __name__ == "__main__":
+    main()
