@@ -2,6 +2,3 @@ streamlit
 pandas
 numpy
 plotly
-pydeck
-scikit-learn
-statsmodels
