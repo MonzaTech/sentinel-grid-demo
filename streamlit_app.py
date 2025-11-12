@@ -1,5 +1,4 @@
-# Sentinel Grid v2.2.1 - Fixed Issues Edition
-# Monza Tech LLC - All issues corrected, with added robustness
+# Sentinel Grid V0.2 - Demo - Monza Tech LLC
 
 import streamlit as st
 import pandas as pd
@@ -19,7 +18,7 @@ import time
 # ============================================================================
 class Config:
     """Global configuration"""
-    LOGO_URL = "https://i.ibb.co/Z17tkjG/wide-logo.png"  # Fixed broken URL if needed
+    LOGO_URL = "https://i.imgur.com/S0DVjiz.png"  # Updated logo URL
     SAMPLE_RATE = 3.0
     MAX_HISTORY = 500
     CRITICAL_THRESHOLD = 0.75
@@ -857,7 +856,7 @@ def main():
         else:
             st.info("No audit events")
     st.markdown("---")
-    st.markdown("<div style='text-align: center; opacity: 0.6;'>Sentinel Grid v2.2.1 - Fixed Issues Edition · Monza Tech LLC</div>", unsafe_allow_html=True)  # Fix: Completed footer
+    st.markdown("<div style='text-align: center; opacity: 0.6;'>Sentinel Grid V0.2 - Demo - Monza Tech LLC</div>", unsafe_allow_html=True)
 
 if __name__ == "__main__":
     main()
