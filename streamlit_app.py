@@ -513,7 +513,7 @@ def create_network_map(_simulator: InfrastructureSimulator, highlight_cascade: L
     )
     return fig
 
-@st.cache_data  # Fix: Cached for performance
+@st.cache_data
 def create_risk_timeline(_history: List[Dict], events: List[Dict] = None) -> go.Figure:
     if not _history or len(_history) < 2:
         fig = go.Figure()
@@ -526,14 +526,17 @@ def create_risk_timeline(_history: List[Dict], events: List[Dict] = None) -> go.
     fig.add_hline(y=Config.CRITICAL_THRESHOLD, line_dash="dash", line_color="red", row=1, col=1)
     fig.add_hline(y=Config.WARNING_THRESHOLD, line_dash="dash", line_color="orange", row=1, col=1)
     if events:
-        for event in events[-5:] if len(events) >= 5 else events:  # Fix: Handle short lists without error
+        for event in events[-5:] if len(events) >= 5 else events:
             try:
                 event_time = event.get('timestamp')
                 if isinstance(event_time, str):
                     event_time = datetime.fromisoformat(event_time.replace('Z', '+00:00'))
-                fig.add_vline(x=event_time, line_dash="dot", line_color="cyan", annotation_text=event.get('type', '')[:10], row=1, col=1)
+                elif isinstance(event_time, int):
+                    event_time = datetime.fromtimestamp(event_time)  # Handle potential Unix timestamp
+                if isinstance(event_time, datetime):
+                    fig.add_vline(x=event_time, line_dash="dot", line_color="cyan", annotation_text=event.get('type', '')[:10], row=1, col=1)
             except Exception as e:
-                st.error(f"Timeline event error: {e}")  # Fix: Log errors without crashing
+                st.error(f"Timeline event error: {e}")
                 pass
     fig.add_trace(go.Scatter(x=df['timestamp'], y=df['load_ratio'], mode='lines', name='Load Ratio', line=dict(color='#48dbfb', width=2), fill='tozeroy', fillcolor='rgba(72, 219, 251, 0.2)'), row=2, col=1)
     fig.add_trace(go.Scatter(x=df['timestamp'], y=df['avg_health'], mode='lines', name='Avg Health', line=dict(color='#1dd1a1', width=2), fill='tozeroy', fillcolor='rgba(29, 209, 161, 0.2)'), row=3, col=1)
